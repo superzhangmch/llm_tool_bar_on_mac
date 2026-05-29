@@ -8,6 +8,8 @@ etymology).
 
 Single-file SwiftUI + AppKit app — all of `EngBar.swift`.
 
+(By AI, for personal use only)
+
 ## Features
 
 - Floating, borderless top bar; summoned from the menu-bar icon, hides on blur.
@@ -21,6 +23,8 @@ Single-file SwiftUI + AppKit app — all of `EngBar.swift`.
   - **词源** — etymology
 - Prompt caching (`cache_control: ephemeral`), TTFT + token-usage readout,
   stop / retry / copy controls, readline-style `Ctrl+U` / `Ctrl+W` in the input.
+
+<img width="1218" height="866" alt="image" src="https://github.com/user-attachments/assets/92551813-a755-4398-8933-db237a405d57" />
 
 ## Build
 
