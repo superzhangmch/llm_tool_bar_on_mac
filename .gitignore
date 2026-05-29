@@ -1,0 +1,13 @@
+# Build output
+build/
+*.app
+
+# Compiled binary / test artifacts
+EngBar
+/tmp/EngBar_test
+
+# Real runtime config (holds the API key) — never commit. Use config.example.json.
+config.json
+
+# macOS
+.DS_Store

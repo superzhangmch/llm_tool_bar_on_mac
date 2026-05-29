@@ -1,0 +1,5 @@
+{
+  "apiBase": "http://localhost:4001",
+  "apiKey": "sk-REPLACE_ME",
+  "defaultModel": "claude-sonnet-4-6"
+}
