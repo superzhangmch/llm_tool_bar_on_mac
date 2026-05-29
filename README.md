@@ -8,7 +8,7 @@ etymology).
 
 Single-file SwiftUI + AppKit app — all of `EngBar.swift`.
 
-(By AI, for personal use only)
+(By AI, 个人自娱自乐使用的)
 
 ## Features
 
