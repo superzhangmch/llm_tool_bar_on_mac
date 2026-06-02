@@ -1827,6 +1827,13 @@ struct BarView: View {
                                 .font(.system(size: 10).monospacedDigit())
                                 .foregroundColor(Color(white: 0.55))
                                 .help("距下次护眼休息 / time to next eye break")
+                            Button(action: { eyeCare.resetClock() }) {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(Color(white: 0.55))
+                            }
+                            .buttonStyle(.plain)
+                            .help("重置护眼计时 / Reset eye-care timer")
                         }
                     }
                 }
@@ -2148,6 +2155,18 @@ final class EyeCareManager: ObservableObject {
         app?.setEyeAlertIcon(false)
         workStart = Date()
         phase = .working
+    }
+
+    // Manual reset: restart the 20-min work clock from now (and clear any
+    // in-progress break). Invoked by the reset button in the bar.
+    func resetClock() {
+        guard started else { return }
+        closeOverlay()
+        app?.setEyeAlertIcon(false)
+        pausedAt = nil
+        workStart = Date()
+        phase = .working
+        updateRemaining()
     }
 
     // MARK: pause / resume (lock, sleep, screensaver)
