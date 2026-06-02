@@ -24,6 +24,7 @@ struct EngConfig: Decodable {
     var eyeBreakSeconds: Double?
     var eyeAutoCloseSeconds: Double?
     var eyeResetGapSeconds: Double?
+    var eyePopupIdleSkipSeconds: Double?   // idle ≥ this at break → red icon only, no popup
 
     static let shared: EngConfig = load()
 
@@ -154,8 +155,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // Swap the menu-bar icon between normal and the red eye-care alert.
-    func setEyeAlertIcon(_ on: Bool) {
-        statusItem?.button?.image = makeStatusIcon(alert: on)
+    // `closed` selects the blink frame (eye shut) for the flashing effect.
+    func setEyeAlertIcon(_ on: Bool, closed: Bool = false) {
+        statusItem?.button?.image = on ? makeEyeAlertIcon(closed: closed) : makeStatusIcon()
     }
 
     func setupFocusObservers() {
@@ -328,7 +330,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makeStatusIcon(alert: Bool = false) -> NSImage {
-        if alert { return makeEyeAlertIcon() }
+        if alert { return makeEyeAlertIcon(closed: false) }
         let size = NSSize(width: 20, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
             let context = NSGraphicsContext.current?.cgContext
@@ -376,64 +378,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
-    // A deliberately menacing red eye for the eye-care break — demon/snake
-    // style: blood-red almond, vertical slit pupil, angry furrowed brow, and a
-    // couple of bloodshot streaks. NOT a template image, so the red shows.
-    private func makeEyeAlertIcon() -> NSImage {
+    // Eye-care break icon on a bright neon-yellow block (hazard yellow+red,
+    // stands out sharply in the menu bar). Two frames — open / closed — toggled
+    // on a timer to make the eye blink. NOT a template image, so colors show.
+    private func makeEyeAlertIcon(closed: Bool) -> NSImage {
         let size = NSSize(width: 20, height: 18)
         let image = NSImage(size: size, flipped: false) { _ in
-            let cx: CGFloat = 10, cy: CGFloat = 8.5
-            let red       = NSColor(calibratedRed: 0.95, green: 0.08, blue: 0.08, alpha: 1)
-            let darkRed   = NSColor(calibratedRed: 0.55, green: 0.0,  blue: 0.0,  alpha: 1)
-            let black     = NSColor.black
+            let neon  = NSColor(calibratedRed: 0.93, green: 1.0, blue: 0.0, alpha: 1)   // highlighter yellow
+            let red   = NSColor(calibratedRed: 0.92, green: 0.05, blue: 0.05, alpha: 1) // iris
+            let white = NSColor.white
+            let ink   = NSColor(calibratedWhite: 0.10, alpha: 1)
 
-            // Almond eye outline (two arcs meeting at sharp corners).
-            let eye = NSBezierPath()
-            let w: CGFloat = 8.5, h: CGFloat = 5.0
-            eye.move(to: NSPoint(x: cx - w, y: cy))
-            eye.curve(to: NSPoint(x: cx + w, y: cy),
-                      controlPoint1: NSPoint(x: cx - 3, y: cy + h),
-                      controlPoint2: NSPoint(x: cx + 3, y: cy + h))
-            eye.curve(to: NSPoint(x: cx - w, y: cy),
-                      controlPoint1: NSPoint(x: cx + 3, y: cy - h),
-                      controlPoint2: NSPoint(x: cx - 3, y: cy - h))
-            eye.close()
-            red.setFill(); eye.fill()
+            // Neon-yellow rounded background block.
+            neon.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 1, y: 1, width: 18, height: 16),
+                         xRadius: 4, yRadius: 4).fill()
 
-            // Bloodshot streaks inside the sclera.
-            darkRed.setStroke()
-            for dx in [-5.0, -2.5, 2.5, 5.0] as [CGFloat] {
-                let s = NSBezierPath()
-                s.lineWidth = 0.6
-                s.move(to: NSPoint(x: cx + dx * 0.6, y: cy))
-                s.line(to: NSPoint(x: cx + dx, y: cy + (dx > 0 ? 1.6 : 1.6)))
-                s.stroke()
+            let cx: CGFloat = 10, cy: CGFloat = 9
+
+            if closed {
+                // Blink frame: a fat closed eyelid with two short lashes.
+                let lid = NSBezierPath()
+                lid.lineWidth = 2.0
+                lid.lineCapStyle = .round
+                lid.move(to: NSPoint(x: cx - 6.5, y: cy + 0.5))
+                lid.curve(to: NSPoint(x: cx + 6.5, y: cy + 0.5),
+                          controlPoint1: NSPoint(x: cx - 2, y: cy - 2.8),
+                          controlPoint2: NSPoint(x: cx + 2, y: cy - 2.8))
+                ink.setStroke(); lid.stroke()
+                for dx in [-4.0, 0.0, 4.0] as [CGFloat] {
+                    let l = NSBezierPath()
+                    l.lineWidth = 1.4; l.lineCapStyle = .round
+                    l.move(to: NSPoint(x: cx + dx * 0.8, y: cy - 2.0))
+                    l.line(to: NSPoint(x: cx + dx, y: cy - 4.2))
+                    ink.setStroke(); l.stroke()
+                }
+            } else {
+                // Open frame: a full almond with a big red iris (饱满).
+                let w: CGFloat = 7.5, h: CGFloat = 4.6
+                let eye = NSBezierPath()
+                eye.move(to: NSPoint(x: cx - w, y: cy))
+                eye.curve(to: NSPoint(x: cx + w, y: cy),
+                          controlPoint1: NSPoint(x: cx - 3.5, y: cy + h),
+                          controlPoint2: NSPoint(x: cx + 3.5, y: cy + h))
+                eye.curve(to: NSPoint(x: cx - w, y: cy),
+                          controlPoint1: NSPoint(x: cx + 3.5, y: cy - h),
+                          controlPoint2: NSPoint(x: cx - 3.5, y: cy - h))
+                eye.close()
+                white.setFill(); eye.fill()          // sclera fills the almond
+
+                let ir: CGFloat = 4.2                 // big iris → 饱满
+                red.setFill()
+                NSBezierPath(ovalIn: NSRect(x: cx - ir, y: cy - ir, width: 2 * ir, height: 2 * ir)).fill()
+                let pr: CGFloat = 1.7
+                ink.setFill()
+                NSBezierPath(ovalIn: NSRect(x: cx - pr, y: cy - pr, width: 2 * pr, height: 2 * pr)).fill()
+
+                eye.lineWidth = 1.2; ink.setStroke(); eye.stroke()   // crisp outline
             }
-
-            // Vertical slit pupil (reptilian → unsettling).
-            let pupil = NSBezierPath()
-            let pw: CGFloat = 1.5, ph: CGFloat = 4.2
-            pupil.move(to: NSPoint(x: cx, y: cy + ph))
-            pupil.curve(to: NSPoint(x: cx, y: cy - ph),
-                        controlPoint1: NSPoint(x: cx + pw, y: cy + 1),
-                        controlPoint2: NSPoint(x: cx + pw, y: cy - 1))
-            pupil.curve(to: NSPoint(x: cx, y: cy + ph),
-                        controlPoint1: NSPoint(x: cx - pw, y: cy - 1),
-                        controlPoint2: NSPoint(x: cx - pw, y: cy + 1))
-            pupil.close()
-            black.setFill(); pupil.fill()
-
-            // Angry furrowed brow slashing down toward the nose.
-            let brow = NSBezierPath()
-            brow.lineWidth = 2.2
-            brow.lineCapStyle = .round
-            brow.move(to: NSPoint(x: cx - 8, y: cy + 4.5))
-            brow.line(to: NSPoint(x: cx + 7, y: cy + 7.2))
-            black.setStroke(); brow.stroke()
-
             return true
         }
-        image.isTemplate = false   // keep the red
+        image.isTemplate = false   // keep the colors
         return image
     }
 
@@ -2023,6 +2028,7 @@ final class EyeCareManager {
     private let breakSeconds: TimeInterval
     private let autoCloseSeconds: TimeInterval
     private let resetGapSeconds: TimeInterval
+    private let popupIdleSkipSeconds: TimeInterval
 
     private enum Phase { case working, breaking, paused }
     private var phase: Phase = .working
@@ -2044,6 +2050,14 @@ final class EyeCareManager {
         breakSeconds     = c.eyeBreakSeconds ?? 60
         autoCloseSeconds = c.eyeAutoCloseSeconds ?? 30
         resetGapSeconds  = c.eyeResetGapSeconds ?? 60
+        popupIdleSkipSeconds = c.eyePopupIdleSkipSeconds ?? 600
+    }
+
+    // Whether to actually show the popup at break time. Suppressed when the
+    // mic is in use (meeting / screen share) OR the machine has been idle for
+    // a while (you're working on another computer) — icon still goes red.
+    private var shouldShowPopup: Bool {
+        !Self.isMicInUse() && Self.secondsSinceInput() < popupIdleSkipSeconds
     }
 
     func start() {
@@ -2088,8 +2102,11 @@ final class EyeCareManager {
     private func beginBreak() {
         phase = .breaking
         breakStart = Date()
-        app?.setEyeAlertIcon(true)            // red eye — ALWAYS, even in a meeting
-        if !Self.isMicInUse() {               // meeting / screen-share → icon only, no popup
+        // Static closed-eye icon on the neon block — noticeable but discreet
+        // (no staring open eye / blinking, so it's not embarrassing on a shared
+        // screen). ALWAYS shown, even in a meeting / when idle.
+        app?.setEyeAlertIcon(true, closed: true)
+        if shouldShowPopup {                  // meeting or long-idle → icon only, no popup
             showOverlay()
         }
     }
@@ -2128,8 +2145,8 @@ final class EyeCareManager {
             breakStart = breakStart.addingTimeInterval(gap)
             phase = phaseBeforePause
             if phase == .breaking {
-                app?.setEyeAlertIcon(true)
-                if !Self.isMicInUse() && overlay == nil { showOverlay() }
+                app?.setEyeAlertIcon(true, closed: true)
+                if shouldShowPopup && overlay == nil { showOverlay() }
             }
         }
     }
@@ -2152,7 +2169,9 @@ final class EyeCareManager {
         p.hasShadow = false
         p.ignoresMouseEvents = false
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.endBreak() }))
+        // Skip only dismisses the popup; the red-eye icon stays for the full
+        // break minute (passive nag), then the heartbeat ends the break.
+        p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.closeOverlay() }))
         p.setFrame(union, display: true)
         p.orderFrontRegardless()
         overlay = p
@@ -2160,7 +2179,7 @@ final class EyeCareManager {
 
         // Esc closes the overlay (skip) without stealing keyboard focus globally.
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
-            if e.keyCode == 53 { self?.endBreak(); return nil }   // Esc
+            if e.keyCode == 53 { self?.closeOverlay(); return nil }   // Esc → dismiss popup, icon stays red
             return e
         }
     }
