@@ -1678,11 +1678,91 @@ struct MarkdownView: NSViewRepresentable {
     }
 }
 
+// MARK: - Input editor with a built-in placeholder
+//
+// SwiftUI's TextEditor gives no way to know its internal text origin, so an
+// overlaid placeholder Text can never be pixel-aligned with the caret. Here we
+// wrap an NSTextView and draw the placeholder at the view's OWN
+// textContainerOrigin + lineFragmentPadding — exactly where the caret/typed
+// text render — so it always lines up. Bonus: the placeholder hides the moment
+// IME composition starts.
+final class PlaceholderTextView: NSTextView {
+    var placeholderString = ""
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !hasMarkedText() else { return }
+        let pad = textContainer?.lineFragmentPadding ?? 0
+        let origin = textContainerOrigin
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 16),
+            .foregroundColor: NSColor(calibratedWhite: 0.55, alpha: 1),
+        ]
+        placeholderString.draw(at: NSPoint(x: origin.x + pad, y: origin.y), withAttributes: attrs)
+    }
+}
+
+struct PlaceholderTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var focusTrigger: Bool
+    var placeholder: String
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let tv = PlaceholderTextView()
+        tv.placeholderString = placeholder
+        tv.delegate = context.coordinator
+        tv.font = .systemFont(ofSize: 16)
+        tv.textColor = .black
+        tv.drawsBackground = false
+        tv.isRichText = false
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.lineBreakMode = .byWordWrapping
+        tv.autoresizingMask = [.width]
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+
+        let scroll = NSScrollView()
+        scroll.documentView = tv
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .noBorder
+        scroll.autohidesScrollers = true
+        context.coordinator.tv = tv
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let tv = scroll.documentView as? PlaceholderTextView else { return }
+        if tv.string != text { tv.string = text; tv.needsDisplay = true }
+        if focusTrigger {
+            DispatchQueue.main.async {
+                tv.window?.makeFirstResponder(tv)
+                focusTrigger = false
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: PlaceholderTextEditor
+        weak var tv: PlaceholderTextView?
+        init(_ p: PlaceholderTextEditor) { parent = p }
+        func textDidChange(_ n: Notification) {
+            guard let v = n.object as? NSTextView else { return }
+            parent.text = v.string
+            v.needsDisplay = true   // refresh placeholder visibility
+        }
+    }
+}
+
 // MARK: - SwiftUI Views
 struct BarView: View {
     @ObservedObject var viewModel: BarViewModel
     @ObservedObject var eyeCare: EyeCareManager
-    @FocusState private var inputFocused: Bool
 
     private let bg = Color.white
     // Uniform tap-target size for icon buttons in the expanded row, so SF
@@ -1703,28 +1783,15 @@ struct BarView: View {
             // input's first text line.
             HStack(alignment: .top, spacing: 6) {
                 // ── INPUT (left) ────────────────────────────────────────────
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $viewModel.input)
-                        .font(.system(size: 16))
-                        .foregroundColor(.black)
-                        .scrollContentBackground(.hidden)
-                        .focused($inputFocused)
-
-                    if viewModel.input.isEmpty {
-                        Text("ask anything... (use / to start new session)")
-                            .font(.system(size: 16))
-                            .foregroundColor(Color(white: 0.55))
-                            .padding(.leading, 5)
-                            .padding(.top, 8)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .frame(height: 100)  // ~4 lines at 16pt
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2)
-                .background(Color.white)
-                .cornerRadius(4)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color(white: 0.7), lineWidth: 1))
+                PlaceholderTextEditor(text: $viewModel.input,
+                                      focusTrigger: $viewModel.focusInput,
+                                      placeholder: "ask anything... (use / to start new session)")
+                    .frame(height: 100)  // ~4 lines at 16pt
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .background(Color.white)
+                    .cornerRadius(4)
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color(white: 0.7), lineWidth: 1))
 
                 // ── BUTTONS (right, two rows) ───────────────────────────────
                 VStack(alignment: .trailing, spacing: 8) {
@@ -1953,9 +2020,6 @@ struct BarView: View {
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color(white: 0.8), lineWidth: 0.5))
         .shadow(color: .black.opacity(0.15), radius: 3, y: 2)
-        .onChange(of: viewModel.focusInput) { newVal in
-            if newVal { inputFocused = true; viewModel.focusInput = false }
-        }
         .onExitCommand {
             // Esc → hide the whole bar (consistent with click-outside / blur).
             (NSApp.delegate as? AppDelegate)?.panel.orderOut(nil)
