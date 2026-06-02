@@ -1818,12 +1818,16 @@ struct BarView: View {
                                       help: "英语词源 / Etymology", action: doEtymology)
                     }
 
-                    // Row 3 (last): primary send action + eye-care countdown
+                    // Row 3: primary send action
                     HStack(spacing: 10) {
                         captionButton(icon: "paperplane.fill", title: "send",
                                       help: "发送 / Send", action: doSubmit)
-                        if !eyeCare.remainingText.isEmpty {
-                            Text(eyeCare.remainingText)
+                    }
+
+                    // Row 4: eye-care countdown — 👁 mm:ss ↺
+                    if !eyeCare.remainingText.isEmpty {
+                        HStack(spacing: 6) {
+                            Text("👁 \(eyeCare.remainingText)")
                                 .font(.system(size: 10).monospacedDigit())
                                 .foregroundColor(Color(white: 0.55))
                                 .help("距下次护眼休息 / time to next eye break")
