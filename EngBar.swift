@@ -137,11 +137,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var viewModel = BarViewModel()
     var eventMonitor: Any?
     var clickMonitor: Any?
-    var eyeCare: EyeCareManager?
+    var eyeCare: EyeCareManager!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupEditMenu()
         setupStatusItem()
+        eyeCare = EyeCareManager(app: self)   // created before the panel so BarView can observe it
         setupPanel()
         setupGlobalHotkey()
         setupClickOutsideMonitor()
@@ -149,8 +150,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         showPanel()
 
         if EngConfig.shared.eyeCareEnabled ?? true {
-            eyeCare = EyeCareManager(app: self)
-            eyeCare?.start()
+            eyeCare.start()                   // disabled → stays dormant, remainingText == ""
         }
     }
 
@@ -443,7 +443,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupPanel() {
-        let content = BarView(viewModel: viewModel)
+        let content = BarView(viewModel: viewModel, eyeCare: eyeCare)
         let hostingView = FirstMouseHostingView(rootView: content)
 
         // Fixed bar height: TextEditor (93) + paddings + border ≈ 107.
@@ -1681,6 +1681,7 @@ struct MarkdownView: NSViewRepresentable {
 // MARK: - SwiftUI Views
 struct BarView: View {
     @ObservedObject var viewModel: BarViewModel
+    @ObservedObject var eyeCare: EyeCareManager
     @FocusState private var inputFocused: Bool
 
     private let bg = Color.white
@@ -1817,10 +1818,16 @@ struct BarView: View {
                                       help: "英语词源 / Etymology", action: doEtymology)
                     }
 
-                    // Row 3 (last): primary send action
-                    HStack(spacing: 12) {
+                    // Row 3 (last): primary send action + eye-care countdown
+                    HStack(spacing: 10) {
                         captionButton(icon: "paperplane.fill", title: "send",
                                       help: "发送 / Send", action: doSubmit)
+                        if !eyeCare.remainingText.isEmpty {
+                            Text(eyeCare.remainingText)
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundColor(Color(white: 0.55))
+                                .help("距下次护眼休息 / time to next eye break")
+                        }
                     }
                 }
                 .padding(.top, 4)
@@ -2021,8 +2028,13 @@ struct BarView: View {
 // dormant (you're not looking at the screen → eyes already resting). On return
 // we measure how long you were away: < resetGap (60s) → treat as a non-event
 // and resume; ≥ resetGap → eyes rested, reset the work clock to zero.
-final class EyeCareManager {
+final class EyeCareManager: ObservableObject {
     private weak var app: AppDelegate?
+
+    // Live readout for the bar: time until the next break ("18:32"), "👀 0:45"
+    // during a break, or "" when disabled / paused. Updated every second.
+    @Published var remainingText: String = ""
+    private var started = false
 
     private let workSeconds: TimeInterval
     private let breakSeconds: TimeInterval
@@ -2070,16 +2082,36 @@ final class EyeCareManager {
         dc.addObserver(self, selector: #selector(pause), name: .init("com.apple.screensaver.didstart"), object: nil)
         dc.addObserver(self, selector: #selector(resume), name: .init("com.apple.screensaver.didstop"), object: nil)
 
+        started = true
         workStart = Date()
         phase = .working
         let t = Timer(timeInterval: 1.0, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
         RunLoop.main.add(t, forMode: .common)
         heartbeat = t
+        updateRemaining()
     }
 
     // MARK: heartbeat
 
+    private func mmss(_ secs: TimeInterval) -> String {
+        let s = max(0, Int(secs.rounded()))
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    private func updateRemaining() {
+        guard started else { remainingText = ""; return }
+        switch phase {
+        case .working:
+            remainingText = mmss(workSeconds - Date().timeIntervalSince(workStart))
+        case .breaking:
+            remainingText = "👀 " + mmss(breakSeconds - Date().timeIntervalSince(breakStart))
+        case .paused:
+            remainingText = ""
+        }
+    }
+
     @objc private func tick() {
+        updateRemaining()
         switch phase {
         case .paused:
             return
