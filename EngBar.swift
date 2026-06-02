@@ -2187,28 +2187,27 @@ final class EyeCareManager: ObservableObject {
 
     private func showOverlay() {
         guard overlays.isEmpty else { return }
-        // One overlay panel PER screen, each covering its own display, so the
-        // content centers correctly on every monitor (a single union-rect panel
-        // centers in the union's geometric middle, which lands off-centre on
-        // multi-display setups with differing sizes/arrangement).
-        for screen in NSScreen.screens {
-            let p = NSPanel(contentRect: screen.frame,
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
-            p.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 2)
-            p.isFloatingPanel = true
-            p.backgroundColor = .clear
-            p.isOpaque = false
-            p.hasShadow = false
-            p.ignoresMouseEvents = false
-            p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-            // Skip only dismisses the popup; the red-eye icon stays for the full
-            // break minute (passive nag), then the heartbeat ends the break.
-            p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.closeOverlay() }))
-            p.setFrame(screen.frame, display: true)
-            p.orderFrontRegardless()
-            overlays.append(p)
-        }
+        // Only the built-in MacBook display (fall back to the main screen, then
+        // any screen). On multi-monitor setups we don't blanket every external.
+        let screen = Self.builtinScreen() ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen = screen else { return }
+
+        let p = NSPanel(contentRect: screen.frame,
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 2)
+        p.isFloatingPanel = true
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = false
+        p.ignoresMouseEvents = false
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        // Skip only dismisses the popup; the red-eye icon stays for the full
+        // break minute (passive nag), then the heartbeat ends the break.
+        p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.closeOverlay() }))
+        p.setFrame(screen.frame, display: true)
+        p.orderFrontRegardless()
+        overlays.append(p)
         overlayShown = true
 
         // Esc closes the overlay (skip) without stealing keyboard focus globally.
@@ -2223,6 +2222,15 @@ final class EyeCareManager: ObservableObject {
         overlays.removeAll()
         overlayShown = false
         if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
+    }
+
+    /// The built-in laptop display, if one is currently active.
+    static func builtinScreen() -> NSScreen? {
+        NSScreen.screens.first { s in
+            guard let n = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+            else { return false }
+            return CGDisplayIsBuiltin(n) != 0
+        }
     }
 
     // MARK: signals
