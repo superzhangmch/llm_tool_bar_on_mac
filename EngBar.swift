@@ -2052,7 +2052,7 @@ final class EyeCareManager: ObservableObject {
     private var overlayShown = false
 
     private var heartbeat: Timer?
-    private var overlay: NSPanel?
+    private var overlays: [NSPanel] = []
     private var escMonitor: Any?
 
     init(app: AppDelegate) {
@@ -2178,7 +2178,7 @@ final class EyeCareManager: ObservableObject {
             phase = phaseBeforePause
             if phase == .breaking {
                 app?.setEyeAlertIcon(true, closed: true)
-                if shouldShowPopup && overlay == nil { showOverlay() }
+                if shouldShowPopup && overlays.isEmpty { showOverlay() }
             }
         }
     }
@@ -2186,27 +2186,29 @@ final class EyeCareManager: ObservableObject {
     // MARK: overlay
 
     private func showOverlay() {
-        guard overlay == nil else { return }
-        // Union of all screen frames so every display is covered.
-        let frames = NSScreen.screens.map { $0.frame }
-        let union = frames.dropFirst().reduce(frames.first ?? .zero) { $0.union($1) }
-
-        let p = NSPanel(contentRect: union,
-                        styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
-        p.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 2)
-        p.isFloatingPanel = true
-        p.backgroundColor = .clear
-        p.isOpaque = false
-        p.hasShadow = false
-        p.ignoresMouseEvents = false
-        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        // Skip only dismisses the popup; the red-eye icon stays for the full
-        // break minute (passive nag), then the heartbeat ends the break.
-        p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.closeOverlay() }))
-        p.setFrame(union, display: true)
-        p.orderFrontRegardless()
-        overlay = p
+        guard overlays.isEmpty else { return }
+        // One overlay panel PER screen, each covering its own display, so the
+        // content centers correctly on every monitor (a single union-rect panel
+        // centers in the union's geometric middle, which lands off-centre on
+        // multi-display setups with differing sizes/arrangement).
+        for screen in NSScreen.screens {
+            let p = NSPanel(contentRect: screen.frame,
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 2)
+            p.isFloatingPanel = true
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = false
+            p.ignoresMouseEvents = false
+            p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            // Skip only dismisses the popup; the red-eye icon stays for the full
+            // break minute (passive nag), then the heartbeat ends the break.
+            p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.closeOverlay() }))
+            p.setFrame(screen.frame, display: true)
+            p.orderFrontRegardless()
+            overlays.append(p)
+        }
         overlayShown = true
 
         // Esc closes the overlay (skip) without stealing keyboard focus globally.
@@ -2217,8 +2219,8 @@ final class EyeCareManager: ObservableObject {
     }
 
     private func closeOverlay() {
-        overlay?.orderOut(nil)
-        overlay = nil
+        overlays.forEach { $0.orderOut(nil) }
+        overlays.removeAll()
         overlayShown = false
         if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
     }
