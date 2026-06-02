@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Carbon.HIToolbox
+import CoreAudio
 
 // MARK: - Config
 // Runtime config is read ONCE at launch from:
@@ -10,11 +11,19 @@ import Carbon.HIToolbox
 // and is intentionally NOT checked into source control — see config.example.json.
 //
 // config.json shape:
-//   { "apiBase": "http://localhost:4001", "apiKey": "sk-...", "defaultModel": "claude-sonnet-4-6" }
+//   { "apiBase": "http://localhost:4001", "apiKey": "sk-...", "defaultModel": "claude-sonnet-4-6",
+//     "eyeCareEnabled": true, "eyeWorkMinutes": 20, "eyeBreakSeconds": 60,
+//     "eyeAutoCloseSeconds": 30, "eyeResetGapSeconds": 60 }
 struct EngConfig: Decodable {
     var apiBase: String?
     var apiKey: String?
     var defaultModel: String?
+    // 20-20-20 eye-care timer (all optional; omit to use defaults below)
+    var eyeCareEnabled: Bool?
+    var eyeWorkMinutes: Double?
+    var eyeBreakSeconds: Double?
+    var eyeAutoCloseSeconds: Double?
+    var eyeResetGapSeconds: Double?
 
     static let shared: EngConfig = load()
 
@@ -127,6 +136,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var viewModel = BarViewModel()
     var eventMonitor: Any?
     var clickMonitor: Any?
+    var eyeCare: EyeCareManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupEditMenu()
@@ -136,6 +146,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupClickOutsideMonitor()
         setupFocusObservers()
         showPanel()
+
+        if EngConfig.shared.eyeCareEnabled ?? true {
+            eyeCare = EyeCareManager(app: self)
+            eyeCare?.start()
+        }
+    }
+
+    // Swap the menu-bar icon between normal and the red eye-care alert.
+    func setEyeAlertIcon(_ on: Bool) {
+        statusItem?.button?.image = makeStatusIcon(alert: on)
     }
 
     func setupFocusObservers() {
@@ -307,7 +327,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func makeStatusIcon() -> NSImage {
+    private func makeStatusIcon(alert: Bool = false) -> NSImage {
+        if alert { return makeEyeAlertIcon() }
         let size = NSSize(width: 20, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
             let context = NSGraphicsContext.current?.cgContext
@@ -352,6 +373,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
         image.isTemplate = true
+        return image
+    }
+
+    // A deliberately menacing red eye for the eye-care break — demon/snake
+    // style: blood-red almond, vertical slit pupil, angry furrowed brow, and a
+    // couple of bloodshot streaks. NOT a template image, so the red shows.
+    private func makeEyeAlertIcon() -> NSImage {
+        let size = NSSize(width: 20, height: 18)
+        let image = NSImage(size: size, flipped: false) { _ in
+            let cx: CGFloat = 10, cy: CGFloat = 8.5
+            let red       = NSColor(calibratedRed: 0.95, green: 0.08, blue: 0.08, alpha: 1)
+            let darkRed   = NSColor(calibratedRed: 0.55, green: 0.0,  blue: 0.0,  alpha: 1)
+            let black     = NSColor.black
+
+            // Almond eye outline (two arcs meeting at sharp corners).
+            let eye = NSBezierPath()
+            let w: CGFloat = 8.5, h: CGFloat = 5.0
+            eye.move(to: NSPoint(x: cx - w, y: cy))
+            eye.curve(to: NSPoint(x: cx + w, y: cy),
+                      controlPoint1: NSPoint(x: cx - 3, y: cy + h),
+                      controlPoint2: NSPoint(x: cx + 3, y: cy + h))
+            eye.curve(to: NSPoint(x: cx - w, y: cy),
+                      controlPoint1: NSPoint(x: cx + 3, y: cy - h),
+                      controlPoint2: NSPoint(x: cx - 3, y: cy - h))
+            eye.close()
+            red.setFill(); eye.fill()
+
+            // Bloodshot streaks inside the sclera.
+            darkRed.setStroke()
+            for dx in [-5.0, -2.5, 2.5, 5.0] as [CGFloat] {
+                let s = NSBezierPath()
+                s.lineWidth = 0.6
+                s.move(to: NSPoint(x: cx + dx * 0.6, y: cy))
+                s.line(to: NSPoint(x: cx + dx, y: cy + (dx > 0 ? 1.6 : 1.6)))
+                s.stroke()
+            }
+
+            // Vertical slit pupil (reptilian → unsettling).
+            let pupil = NSBezierPath()
+            let pw: CGFloat = 1.5, ph: CGFloat = 4.2
+            pupil.move(to: NSPoint(x: cx, y: cy + ph))
+            pupil.curve(to: NSPoint(x: cx, y: cy - ph),
+                        controlPoint1: NSPoint(x: cx + pw, y: cy + 1),
+                        controlPoint2: NSPoint(x: cx + pw, y: cy - 1))
+            pupil.curve(to: NSPoint(x: cx, y: cy + ph),
+                        controlPoint1: NSPoint(x: cx - pw, y: cy - 1),
+                        controlPoint2: NSPoint(x: cx - pw, y: cy + 1))
+            pupil.close()
+            black.setFill(); pupil.fill()
+
+            // Angry furrowed brow slashing down toward the nose.
+            let brow = NSBezierPath()
+            brow.lineWidth = 2.2
+            brow.lineCapStyle = .round
+            brow.move(to: NSPoint(x: cx - 8, y: cy + 4.5))
+            brow.line(to: NSPoint(x: cx + 7, y: cy + 7.2))
+            black.setStroke(); brow.stroke()
+
+            return true
+        }
+        image.isTemplate = false   // keep the red
         return image
     }
 
@@ -1921,4 +2003,251 @@ struct BarView: View {
         NSPasteboard.general.setString(viewModel.output, forType: .string)
     }
 
+}
+
+// MARK: - Eye-care (20-20-20)
+//
+// Cycle: work `workMinutes` (default 20) → 1-minute "break" → repeat.
+// During the break the menu-bar icon turns into a menacing red eye (always),
+// and — UNLESS the mic is in use (i.e. you're in a meeting / sharing screen) —
+// a soft full-screen overlay is shown to make you look ~6 m away for 20s.
+//
+// Pausing: while the screen is locked / asleep / screensaver-ed, the timer is
+// dormant (you're not looking at the screen → eyes already resting). On return
+// we measure how long you were away: < resetGap (60s) → treat as a non-event
+// and resume; ≥ resetGap → eyes rested, reset the work clock to zero.
+final class EyeCareManager {
+    private weak var app: AppDelegate?
+
+    private let workSeconds: TimeInterval
+    private let breakSeconds: TimeInterval
+    private let autoCloseSeconds: TimeInterval
+    private let resetGapSeconds: TimeInterval
+
+    private enum Phase { case working, breaking, paused }
+    private var phase: Phase = .working
+    private var phaseBeforePause: Phase = .working
+
+    private var workStart = Date()
+    private var breakStart = Date()
+    private var pausedAt: Date?
+    private var overlayShown = false
+
+    private var heartbeat: Timer?
+    private var overlay: NSPanel?
+    private var escMonitor: Any?
+
+    init(app: AppDelegate) {
+        self.app = app
+        let c = EngConfig.shared
+        workSeconds      = (c.eyeWorkMinutes ?? 20) * 60
+        breakSeconds     = c.eyeBreakSeconds ?? 60
+        autoCloseSeconds = c.eyeAutoCloseSeconds ?? 30
+        resetGapSeconds  = c.eyeResetGapSeconds ?? 60
+    }
+
+    func start() {
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(self, selector: #selector(pause), name: NSWorkspace.willSleepNotification, object: nil)
+        ws.addObserver(self, selector: #selector(resume), name: NSWorkspace.didWakeNotification, object: nil)
+        let dc = DistributedNotificationCenter.default()
+        dc.addObserver(self, selector: #selector(pause), name: .init("com.apple.screenIsLocked"), object: nil)
+        dc.addObserver(self, selector: #selector(resume), name: .init("com.apple.screenIsUnlocked"), object: nil)
+        dc.addObserver(self, selector: #selector(pause), name: .init("com.apple.screensaver.didstart"), object: nil)
+        dc.addObserver(self, selector: #selector(resume), name: .init("com.apple.screensaver.didstop"), object: nil)
+
+        workStart = Date()
+        phase = .working
+        let t = Timer(timeInterval: 1.0, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        RunLoop.main.add(t, forMode: .common)
+        heartbeat = t
+    }
+
+    // MARK: heartbeat
+
+    @objc private func tick() {
+        switch phase {
+        case .paused:
+            return
+        case .working:
+            if Date().timeIntervalSince(workStart) >= workSeconds {
+                beginBreak()
+            }
+        case .breaking:
+            let elapsed = Date().timeIntervalSince(breakStart)
+            if elapsed >= breakSeconds {
+                endBreak()
+            } else if overlayShown && Self.secondsSinceInput() >= autoCloseSeconds {
+                // Nobody's here → that's also rest. Close the popup (icon stays
+                // red until the minute is up), but don't end the break early.
+                closeOverlay()
+            }
+        }
+    }
+
+    private func beginBreak() {
+        phase = .breaking
+        breakStart = Date()
+        app?.setEyeAlertIcon(true)            // red eye — ALWAYS, even in a meeting
+        if !Self.isMicInUse() {               // meeting / screen-share → icon only, no popup
+            showOverlay()
+        }
+    }
+
+    private func endBreak() {
+        closeOverlay()
+        app?.setEyeAlertIcon(false)
+        workStart = Date()
+        phase = .working
+    }
+
+    // MARK: pause / resume (lock, sleep, screensaver)
+
+    @objc private func pause() {
+        guard pausedAt == nil else { return }   // idempotent (lid-close fires several)
+        pausedAt = Date()
+        phaseBeforePause = (phase == .paused) ? .working : phase
+        // Tear down any visible break — you're leaving the screen anyway.
+        closeOverlay()
+        app?.setEyeAlertIcon(false)
+        phase = .paused
+    }
+
+    @objc private func resume() {
+        guard let since = pausedAt else { return }
+        pausedAt = nil
+        let gap = Date().timeIntervalSince(since)
+        if gap >= resetGapSeconds {
+            // Long enough away that the eyes rested → restart the work clock.
+            workStart = Date()
+            phase = .working
+        } else {
+            // Brief lock (a test, a glance) → pretend it never happened: shift
+            // the timestamps forward by the gap and carry on where we left off.
+            workStart = workStart.addingTimeInterval(gap)
+            breakStart = breakStart.addingTimeInterval(gap)
+            phase = phaseBeforePause
+            if phase == .breaking {
+                app?.setEyeAlertIcon(true)
+                if !Self.isMicInUse() && overlay == nil { showOverlay() }
+            }
+        }
+    }
+
+    // MARK: overlay
+
+    private func showOverlay() {
+        guard overlay == nil else { return }
+        // Union of all screen frames so every display is covered.
+        let frames = NSScreen.screens.map { $0.frame }
+        let union = frames.dropFirst().reduce(frames.first ?? .zero) { $0.union($1) }
+
+        let p = NSPanel(contentRect: union,
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()) + 2)
+        p.isFloatingPanel = true
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = false
+        p.ignoresMouseEvents = false
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        p.contentView = NSHostingView(rootView: EyeBreakView(onSkip: { [weak self] in self?.endBreak() }))
+        p.setFrame(union, display: true)
+        p.orderFrontRegardless()
+        overlay = p
+        overlayShown = true
+
+        // Esc closes the overlay (skip) without stealing keyboard focus globally.
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            if e.keyCode == 53 { self?.endBreak(); return nil }   // Esc
+            return e
+        }
+    }
+
+    private func closeOverlay() {
+        overlay?.orderOut(nil)
+        overlay = nil
+        overlayShown = false
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
+    }
+
+    // MARK: signals
+
+    /// True when any process is actively using the default input device — the
+    /// same thing that lights the orange mic dot. Covers Zoom/Teams (even when
+    /// muted-in-app) and browser-based meetings.
+    static func isMicInUse() -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var dev = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size, &dev) == noErr,
+              dev != 0 else { return false }
+        var running = UInt32(0)
+        var rsize = UInt32(MemoryLayout<UInt32>.size)
+        var raddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(dev, &raddr, 0, nil, &rsize, &running) == noErr
+        else { return false }
+        return running != 0
+    }
+
+    /// Seconds since the last keyboard/mouse input, system-wide.
+    static func secondsSinceInput() -> TimeInterval {
+        let any = CGEventType(rawValue: ~0)!   // kCGAnyInputEventType
+        return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: any)
+    }
+}
+
+// MARK: - Eye-care break overlay
+
+struct EyeBreakView: View {
+    var onSkip: () -> Void
+    @State private var remaining = 20
+
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.72).ignoresSafeArea()
+
+            VStack(spacing: 22) {
+                Text("👀")
+                    .font(.system(size: 70))
+                Text("Look 20 feet away")
+                    .font(.system(size: 34, weight: .semibold))
+                    .foregroundColor(.white)
+                Text("Rest your eyes — 20-20-20")
+                    .font(.system(size: 16))
+                    .foregroundColor(Color(white: 0.75))
+
+                Text("\(max(remaining, 0))")
+                    .font(.system(size: 56, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .monospacedDigit()
+                    .padding(.top, 4)
+
+                Button(action: onSkip) {
+                    Text("Skip  (Esc)")
+                        .font(.system(size: 14))
+                        .foregroundColor(Color(white: 0.85))
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                        .background(Color.white.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 8)
+            }
+        }
+        .onReceive(tick) { _ in
+            if remaining > 0 { remaining -= 1 }
+        }
+    }
 }
