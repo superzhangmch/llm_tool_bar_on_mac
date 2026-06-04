@@ -25,6 +25,7 @@ struct EngConfig: Decodable {
     var eyeAutoCloseSeconds: Double?
     var eyeResetGapSeconds: Double?
     var eyePopupIdleSkipSeconds: Double?   // idle ≥ this at break → red icon only, no popup
+    var workSessionGapMinutes: Double?     // idle / lock ≥ this → continuous-work session resets
 
     static let shared: EngConfig = load()
 
@@ -1905,6 +1906,13 @@ struct BarView: View {
                             }
                             .buttonStyle(.plain)
                             .help("重置护眼计时 / Reset eye-care timer")
+
+                            if !eyeCare.workedText.isEmpty {
+                                Text(eyeCare.workedText)
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(white: 0.55))
+                                    .help("连续在屏前的时长 / continuous screen time")
+                            }
                         }
                     }
                 }
@@ -2109,6 +2117,9 @@ final class EyeCareManager: ObservableObject {
     // Live readout for the bar: time until the next break ("18:32"), "👀 0:45"
     // during a break, or "" when disabled / paused. Updated every second.
     @Published var remainingText: String = ""
+    // "🪑 2h15m" — how long you've been continuously at the screen. A gap
+    // (idle / lock ≥ workGapSeconds) resets it. Not persisted across launches.
+    @Published var workedText: String = ""
     private var started = false
 
     private let workSeconds: TimeInterval
@@ -2116,6 +2127,10 @@ final class EyeCareManager: ObservableObject {
     private let autoCloseSeconds: TimeInterval
     private let resetGapSeconds: TimeInterval
     private let popupIdleSkipSeconds: TimeInterval
+    private let workGapSeconds: TimeInterval
+
+    private var workSessionStart = Date()
+    private var workSessionEnded = false
 
     private enum Phase { case working, breaking, paused }
     private var phase: Phase = .working
@@ -2138,6 +2153,7 @@ final class EyeCareManager: ObservableObject {
         autoCloseSeconds = c.eyeAutoCloseSeconds ?? 30
         resetGapSeconds  = c.eyeResetGapSeconds ?? 60
         popupIdleSkipSeconds = c.eyePopupIdleSkipSeconds ?? 600
+        workGapSeconds   = (c.workSessionGapMinutes ?? 20) * 60
     }
 
     // Whether to actually show the popup at break time. Suppressed when the
@@ -2159,6 +2175,7 @@ final class EyeCareManager: ObservableObject {
 
         started = true
         workStart = Date()
+        workSessionStart = Date()
         phase = .working
         let t = Timer(timeInterval: 1.0, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
         RunLoop.main.add(t, forMode: .common)
@@ -2185,8 +2202,28 @@ final class EyeCareManager: ObservableObject {
         }
     }
 
+    private func hm(_ secs: TimeInterval) -> String {
+        let m = max(0, Int(secs) / 60)
+        return m >= 60 ? "\(m / 60)h\(m % 60)m" : "\(m)m"
+    }
+
+    // Continuous-work tracker. A gap = no input for > workGapSeconds; on the
+    // first activity after such a gap, restart the session from now. Sub-gap
+    // pauses (≤ threshold) are kept inside the session (wall-clock duration).
+    private func updateWorkSession() {
+        let idle = Self.secondsSinceInput()
+        if idle > workGapSeconds {
+            workSessionEnded = true
+        } else if workSessionEnded {
+            workSessionStart = Date()      // activity resumed after a long gap
+            workSessionEnded = false
+        }
+        workedText = "🪑 " + hm(Date().timeIntervalSince(workSessionStart))
+    }
+
     @objc private func tick() {
         updateRemaining()
+        if phase != .paused { updateWorkSession() }
         switch phase {
         case .paused:
             return
@@ -2253,6 +2290,12 @@ final class EyeCareManager: ObservableObject {
         guard let since = pausedAt else { return }
         pausedAt = nil
         let gap = Date().timeIntervalSince(since)
+
+        // Continuous-work session: a lock/sleep > workGapSeconds ends it;
+        // shorter ones stay inside the session (counted as continuous time).
+        workSessionEnded = false
+        if gap > workGapSeconds { workSessionStart = Date() }
+
         if gap >= resetGapSeconds {
             // Long enough away that the eyes rested → restart the work clock.
             workStart = Date()
