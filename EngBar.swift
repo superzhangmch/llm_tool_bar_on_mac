@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import Carbon.HIToolbox
 import CoreAudio
+import SQLite3
 
 // MARK: - Config
 // Runtime config is read ONCE at launch from:
@@ -26,6 +27,8 @@ struct EngConfig: Decodable {
     var eyeResetGapSeconds: Double?
     var eyePopupIdleSkipSeconds: Double?   // idle ≥ this at break → red icon only, no popup
     var workSessionGapMinutes: Double?     // idle / lock ≥ this → continuous-work session resets
+    var chatWebPort: Int?                  // port of the my_chat web UI (opened via the bar button)
+    var chatDbPath: String?                // my_chat sqlite db; toolbar chats are persisted here too
 
     static let shared: EngConfig = load()
 
@@ -58,6 +61,87 @@ let LLM_FALLBACK_MODELS: [String] = [
     "gpt-5",
     "gpt-5.1",
 ]
+
+// MARK: - Shared chat history (my_chat sqlite)
+//
+// The toolbar persists normal chats into my_chat's chat.db so the menu-bar bar
+// and the my_chat web UI become two front-ends over the same history. We write
+// the sqlite directly (not via my_chat's HTTP API) — the two stay independent
+// at runtime, coupled only by the table layout below. SHARED_HISTORY=1 in
+// my_chat means the web lists all sessions regardless of owner, so a fixed
+// owner id is fine. WAL mode + busy_timeout makes concurrent access safe.
+//
+// Schema (must match pocketchat.py):
+//   sessions(id, owner_id, title, model, created_at, updated_at)
+//   messages(session_id, role, content, content_type, model, created_at, …)
+final class ChatStore {
+    static let shared = ChatStore()
+    private let queue = DispatchQueue(label: "engbar.chatdb")
+    private let owner = "engbar"
+    private static let TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    private var dbPath: String {
+        EngConfig.shared.chatDbPath ?? (NSHomeDirectory() + "/Desktop/my_code/my_chat/chat.db")
+    }
+
+    static func newSessionId() -> String {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let b64 = Data(bytes).base64EncodedString()
+        return b64.replacingOccurrences(of: "+", with: "-")
+                  .replacingOccurrences(of: "/", with: "_")
+                  .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func withDB(_ body: @escaping (OpaquePointer) -> Void) {
+        queue.async {
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(self.dbPath, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+                  let db = db else {
+                if let db = db { sqlite3_close(db) }
+                return
+            }
+            sqlite3_busy_timeout(db, 3000)
+            body(db)
+            sqlite3_close(db)
+        }
+    }
+
+    private func run(_ db: OpaquePointer, _ sql: String, _ binds: [Any?]) {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        for (i, v) in binds.enumerated() {
+            let idx = Int32(i + 1)
+            switch v {
+            case let s as String: sqlite3_bind_text(stmt, idx, s, -1, Self.TRANSIENT)
+            case let n as Int:     sqlite3_bind_int64(stmt, idx, Int64(n))
+            case nil:              sqlite3_bind_null(stmt, idx)
+            default:               sqlite3_bind_null(stmt, idx)
+            }
+        }
+        sqlite3_step(stmt)
+    }
+
+    /// Create the session row if it doesn't exist yet.
+    func ensureSession(id: String, model: String, title: String, at now: Int) {
+        withDB { db in
+            self.run(db,
+                "INSERT OR IGNORE INTO sessions (id, owner_id, title, model, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                [id, self.owner, title.isEmpty ? "New chat" : title, model, now, now])
+        }
+    }
+
+    /// Append a message and bump the session's updated_at.
+    func appendMessage(sessionId: String, role: String, content: String, model: String?, at now: Int) {
+        withDB { db in
+            self.run(db,
+                "INSERT INTO messages (session_id, role, content, content_type, model, created_at) VALUES (?,?,?,?,?,?)",
+                [sessionId, role, content, "text", model, now])
+            self.run(db, "UPDATE sessions SET updated_at=? WHERE id=?", [now, sessionId])
+        }
+    }
+}
 
 // MARK: - App Entry
 @main
@@ -159,6 +243,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // `closed` selects the blink frame (eye shut) for the flashing effect.
     func setEyeAlertIcon(_ on: Bool, closed: Bool = false) {
         statusItem?.button?.image = on ? makeEyeAlertIcon(closed: closed) : makeStatusIcon()
+    }
+
+    // This machine's Tailscale IPv4 (CGNAT 100.64.0.0/10), if up. Used to open
+    // the my_chat web UI at the machine's own Tailscale address.
+    static func tailscaleIP() -> String? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let head = head else { return nil }
+        defer { freeifaddrs(head) }
+        var ptr: UnsafeMutablePointer<ifaddrs>? = head
+        while let p = ptr {
+            defer { ptr = p.pointee.ifa_next }
+            guard let sa = p.pointee.ifa_addr,
+                  sa.pointee.sa_family == UInt8(AF_INET),
+                  (Int32(p.pointee.ifa_flags) & IFF_UP) != 0 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(sa, socklen_t(sa.pointee.sa_len),
+                        &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: host)
+            let parts = ip.split(separator: ".")
+            if parts.count == 4, parts[0] == "100",
+               let b = Int(parts[1]), (64...127).contains(b) {
+                return ip
+            }
+        }
+        return nil
     }
 
     func setupFocusObservers() {
@@ -701,6 +810,17 @@ class BarViewModel: ObservableObject {
     // the retry button to re-ask the same question.
     var lastUserText: String?
 
+    // Shared-history (my_chat chat.db) persistence state. dbSessionId is the
+    // current chat.db session row; nil until the first turn of a new session.
+    // persistTurn is false for one-shot tool modes (correct/explain/etym) so
+    // they don't pollute the shared history.
+    private var dbSessionId: String?
+    private var persistTurn = false
+
+    /// Current shared-history session id, if a normal chat is in progress —
+    /// used to deep-link the web button to this session (…/#<id>).
+    var currentSessionId: String? { dbSessionId }
+
     // Bumps each time the user submits a new question. MarkdownView watches
     // it and on change scrolls the NSTextView so the newly-appended user
     // question sits at the top of the visible area.
@@ -853,6 +973,7 @@ class BarViewModel: ObservableObject {
         conversationHistory = []
         lastAssistantReply = ""
         lastGenerateTime = nil
+        dbSessionId = nil
     }
 
     // MARK: LLM Streaming
@@ -860,6 +981,26 @@ class BarViewModel: ObservableObject {
         let isContinue = (mode == .continueChat)
         let hasImages = !pastedImages.isEmpty
         let activeModel = model
+
+        // Shared history: persist normal chats into my_chat's chat.db. One-shot
+        // tools (correct/explain/etym) are not persisted; they also end the
+        // current shared session so the next normal chat starts fresh there.
+        persistTurn = (mode == .newChat || mode == .continueChat)
+        if persistTurn {
+            let now = Int(Date().timeIntervalSince1970)
+            if mode == .newChat || dbSessionId == nil {
+                let sid = ChatStore.newSessionId()
+                dbSessionId = sid
+                ChatStore.shared.ensureSession(id: sid, model: activeModel,
+                                               title: Self.firstLine(actualText), at: now)
+            }
+            if let sid = dbSessionId {
+                ChatStore.shared.appendMessage(sessionId: sid, role: "user",
+                                               content: actualText, model: activeModel, at: now)
+            }
+        } else {
+            dbSessionId = nil   // a tool turn breaks the shared session
+        }
 
         // System prompt is always the generic helpful-assistant. For one-shot
         // tools (corrector / explain / etymology) the actual instruction is
@@ -900,6 +1041,7 @@ class BarViewModel: ObservableObject {
                     ["role": "user", "content": actualText],
                     ["role": "assistant", "content": cached]
                 ]
+                persistAssistant(cached)
                 return
             }
         }
@@ -1014,9 +1156,25 @@ class BarViewModel: ObservableObject {
         if let key = pendingCacheKey, !output.isEmpty {
             llmCache.put(key, output)
         }
+        persistAssistant(lastAssistantReply)
         pendingRequest = nil
         pendingCacheKey = nil
         retriesLeft = 0
+    }
+
+    // Write the assistant reply into the shared chat.db (normal chats only).
+    private func persistAssistant(_ reply: String) {
+        guard persistTurn, let sid = dbSessionId,
+              !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        ChatStore.shared.appendMessage(sessionId: sid, role: "assistant",
+                                       content: reply, model: model,
+                                       at: Int(Date().timeIntervalSince1970))
+    }
+
+    static func firstLine(_ s: String) -> String {
+        let line = s.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
+        return line.count > 60 ? String(line.prefix(60)) + "…" : line
     }
 
     func handleStreamFailure(message: String) {
@@ -1886,10 +2044,13 @@ struct BarView: View {
                                       help: "英语词源 / Etymology", action: doEtymology)
                     }
 
-                    // Row 3: primary send action
+                    // Row 3: primary send action + open my_chat web
                     HStack(spacing: 10) {
                         captionButton(icon: "paperplane.fill", title: "send",
                                       help: "发送 / Send", action: doSubmit)
+                        captionButton(icon: "globe", title: "web",
+                                      help: "打开 my_chat 网页 / Open my_chat web",
+                                      action: doOpenChatWeb)
                     }
 
                     // Row 4: eye-care countdown — 👁 mm:ss ↺
@@ -2046,6 +2207,18 @@ struct BarView: View {
 
     private func doStop() {
         viewModel.stop()
+    }
+
+    // Open the my_chat web UI at this machine's own Tailscale IP (falls back to
+    // localhost if Tailscale isn't up). Port is configurable, defaults to 8766.
+    private func doOpenChatWeb() {
+        let port = EngConfig.shared.chatWebPort ?? 8766
+        let host = AppDelegate.tailscaleIP() ?? "localhost"
+        // If a normal chat is in progress, deep-link straight to that session.
+        let frag = viewModel.currentSessionId.map { "#\($0)" } ?? ""
+        if let url = URL(string: "http://\(host):\(port)/\(frag)") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private func doCorrect() {
