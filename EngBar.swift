@@ -74,6 +74,14 @@ let LLM_FALLBACK_MODELS: [String] = [
 // Schema (must match pocketchat.py):
 //   sessions(id, owner_id, title, model, created_at, updated_at)
 //   messages(session_id, role, content, content_type, model, created_at, …)
+struct SessionRow: Identifiable {
+    let id: String
+    let title: String
+    let model: String
+    let updatedAt: Int
+    let createdAt: Int
+}
+
 final class ChatStore {
     static let shared = ChatStore()
     private let queue = DispatchQueue(label: "engbar.chatdb")
@@ -140,6 +148,67 @@ final class ChatStore {
                 [sessionId, role, content, "text", model, now])
             self.run(db, "UPDATE sessions SET updated_at=? WHERE id=?", [now, sessionId])
         }
+    }
+
+    private func col(_ stmt: OpaquePointer?, _ i: Int32) -> String {
+        guard let c = sqlite3_column_text(stmt, i) else { return "" }
+        return String(cString: c)
+    }
+
+    /// Latest sessions (any owner — my_chat runs SHARED_HISTORY), most recent first.
+    func listSessions(limit: Int, _ done: @escaping ([SessionRow]) -> Void) {
+        withDB { db in
+            var rows: [SessionRow] = []
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db,
+                "SELECT id, title, model, updated_at, created_at FROM sessions ORDER BY updated_at DESC LIMIT ?",
+                -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(stmt, 1, Int64(limit))
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    rows.append(SessionRow(id: self.col(stmt, 0),
+                                           title: self.col(stmt, 1),
+                                           model: self.col(stmt, 2),
+                                           updatedAt: Int(sqlite3_column_int64(stmt, 3)),
+                                           createdAt: Int(sqlite3_column_int64(stmt, 4))))
+                }
+            }
+            sqlite3_finalize(stmt)
+            DispatchQueue.main.async { done(rows) }
+        }
+    }
+
+    /// All messages of a session in order, as (role, text). Image "parts"
+    /// content is flattened to its text fields (best-effort).
+    func loadMessages(sessionId: String, _ done: @escaping ([(role: String, text: String)]) -> Void) {
+        withDB { db in
+            var out: [(role: String, text: String)] = []
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db,
+                "SELECT role, content, content_type FROM messages WHERE session_id=? ORDER BY id",
+                -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, sessionId, -1, Self.TRANSIENT)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let role = self.col(stmt, 0)
+                    let content = self.col(stmt, 1)
+                    let ctype = self.col(stmt, 2)
+                    out.append((role, ctype == "parts" ? Self.textFromParts(content) : content))
+                }
+            }
+            sqlite3_finalize(stmt)
+            DispatchQueue.main.async { done(out) }
+        }
+    }
+
+    private static func textFromParts(_ json: String) -> String {
+        guard let data = json.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return json
+        }
+        let texts = arr.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+        let imgCount = arr.filter { ($0["type"] as? String)?.contains("image") ?? false }.count
+        var s = texts.joined(separator: "\n")
+        if imgCount > 0 { s += (s.isEmpty ? "" : "\n") + "*[\(imgCount) image\(imgCount > 1 ? "s" : "")]*" }
+        return s
     }
 }
 
@@ -646,6 +715,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.makeKeyAndOrderFront(nil)
         positionAtTop()
         NSApp.activate(ignoringOtherApps: true)
+        viewModel.refreshSessions()   // keep the "list" menu current
         // Re-show the result dropdown if there's content waiting from a prior session.
         if viewModel.isLoading || !viewModel.output.isEmpty {
             viewModel.showOutput = true
@@ -820,6 +890,52 @@ class BarViewModel: ObservableObject {
     /// Current shared-history session id, if a normal chat is in progress —
     /// used to deep-link the web button to this session (…/#<id>).
     var currentSessionId: String? { dbSessionId }
+
+    // Recent sessions for the "list" menu (refreshed when the bar is shown /
+    // after each completed turn).
+    @Published var sessions: [SessionRow] = []
+
+    func refreshSessions() {
+        ChatStore.shared.listSessions(limit: 20) { [weak self] rows in
+            self?.sessions = rows
+        }
+    }
+
+    // Load a past session from chat.db into the bar: rebuild the transcript +
+    // conversation history, and continue appending to that same session.
+    func loadSession(_ id: String, resizer: @escaping (CGFloat) -> Void) {
+        ChatStore.shared.loadMessages(sessionId: id) { [weak self] msgs in
+            guard let self = self else { return }
+            self.streamTask?.cancel()
+            self.pendingRetry?.cancel(); self.pendingRetry = nil
+            self.isLoading = false
+
+            var transcript = ""
+            var history: [[String: Any]] = []
+            var lastAsst = ""
+            for m in msgs {
+                history.append(["role": m.role, "content": m.text])
+                if m.role == "user" {
+                    if !transcript.isEmpty { transcript += "\n\n---\n\n" }
+                    transcript += "<USER>\(m.text)</USER>\n\n"
+                } else {
+                    transcript += m.text
+                    lastAsst = m.text
+                }
+            }
+            self.conversationHistory = history
+            self.lastAssistantReply = lastAsst
+            self.lastSystem = "You are a helpful assistant. Answer concisely. Use markdown formatting when appropriate."
+            self.dbSessionId = id
+            self.persistTurn = true
+            self.lastGenerateTime = Date()   // next input continues (not a stale new session)
+            self.output = transcript
+            self.showOutput = true
+            self.input = ""
+            resizer(394)
+            self.scrollPinTick &+= 1
+        }
+    }
 
     // Bumps each time the user submits a new question. MarkdownView watches
     // it and on change scrolls the NSTextView so the newly-appended user
@@ -1157,6 +1273,7 @@ class BarViewModel: ObservableObject {
             llmCache.put(key, output)
         }
         persistAssistant(lastAssistantReply)
+        if persistTurn { refreshSessions() }
         pendingRequest = nil
         pendingCacheKey = nil
         retriesLeft = 0
@@ -1169,6 +1286,13 @@ class BarViewModel: ObservableObject {
         ChatStore.shared.appendMessage(sessionId: sid, role: "assistant",
                                        content: reply, model: model,
                                        at: Int(Date().timeIntervalSince1970))
+    }
+
+    // Compact local timestamp for the session list, e.g. "06-09 16:44".
+    static func shortTime(_ unix: Int) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(unix)))
     }
 
     static func firstLine(_ s: String) -> String {
@@ -2039,15 +2163,36 @@ struct BarView: View {
                         captionButton(icon: "text.magnifyingglass", title: "解读",
                                       help: "难句解读 / Explain hard sentence",
                                       action: doExplain)
-                        dotSeparator
-                        captionButton(icon: "book.closed", title: "词源",
+                        captionButton(icon: "book.closed", title: "ety",
                                       help: "英语词源 / Etymology", action: doEtymology)
                     }
 
-                    // Row 3: primary send action + open my_chat web
+                    // Row 3: send + history (load past session) + open my_chat web
                     HStack(spacing: 10) {
                         captionButton(icon: "paperplane.fill", title: "send",
                                       help: "发送 / Send", action: doSubmit)
+
+                        Menu {
+                            if viewModel.sessions.isEmpty {
+                                Text("No sessions")
+                            } else {
+                                ForEach(viewModel.sessions) { s in
+                                    Button("\(BarViewModel.shortTime(s.createdAt))  \(Self.menuTitle(s.title))") {
+                                        loadSession(s.id)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "list.bullet")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(Color(white: 0.4))
+                                .frame(width: iconBox.width, height: iconBox.height)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("历史会话 / Recent sessions")
+
                         captionButton(icon: "globe", title: "web",
                                       help: "打开 my_chat 网页 / Open my_chat web",
                                       action: doOpenChatWeb)
@@ -2209,6 +2354,11 @@ struct BarView: View {
         viewModel.stop()
     }
 
+    private func loadSession(_ id: String) {
+        guard let d = NSApp.delegate as? AppDelegate else { return }
+        viewModel.loadSession(id) { h in d.resizePanel(height: h) }
+    }
+
     // Open the my_chat web UI at this machine's own Tailscale IP (falls back to
     // localhost if Tailscale isn't up). Port is configurable, defaults to 8766.
     private func doOpenChatWeb() {
@@ -2236,11 +2386,13 @@ struct BarView: View {
         viewModel.submit(mode: .explain) { h in d.resizePanel(height: h) }
     }
 
-    // Small middle-dot used as a visual separator between caption buttons.
-    private var dotSeparator: some View {
-        Text("·")
-            .font(.system(size: 12))
-            .foregroundColor(Color(white: 0.55))
+    // Truncate a session title for the list menu — titles from the web side
+    // aren't length-capped, and a long one would stretch the menu very wide.
+    static func menuTitle(_ t: String) -> String {
+        let s = t.replacingOccurrences(of: "\n", with: " ")
+                 .trimmingCharacters(in: .whitespaces)
+        if s.isEmpty { return "(untitled)" }
+        return s.count > 40 ? String(s.prefix(40)) + "…" : s
     }
 
     // Compact icon + text label button, used for the second row of action
