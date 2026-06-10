@@ -89,7 +89,7 @@ final class ChatStore {
     private static let TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     private var dbPath: String {
-        EngConfig.shared.chatDbPath ?? (NSHomeDirectory() + "/Desktop/my_code/my_chat/chat.db")
+        EngConfig.shared.chatDbPath ?? (NSHomeDirectory() + "/pocketchat/chat.db")
     }
 
     static func newSessionId() -> String {
